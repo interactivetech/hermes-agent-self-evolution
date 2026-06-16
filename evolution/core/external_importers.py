@@ -442,9 +442,10 @@ class RelevanceFilter:
         assistant_response: str = dspy.InputField(desc="The assistant's actual response (may be empty)")
         scoring: str = dspy.OutputField(desc="JSON object with: relevant, expected_behavior, difficulty, category")
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, lm_kwargs: Optional[dict] = None):
         self.scorer = dspy.ChainOfThought(self.ScoreRelevance)
         self.model = model
+        self.lm_kwargs = lm_kwargs or {}
 
     def filter_and_score(
         self,
@@ -490,7 +491,7 @@ class RelevanceFilter:
         # Stage 2: LLM relevance scoring
         examples = []
         errors = 0
-        lm = dspy.LM(self.model)
+        lm = dspy.LM(self.model, **self.lm_kwargs)
 
         with Progress() as progress:
             task = progress.add_task("Scoring relevance...", total=len(candidates))
@@ -609,6 +610,7 @@ def build_dataset_from_external(
     sources: list[str],
     output_path: Path,
     model: str,
+    lm_kwargs: Optional[dict] = None,
     max_examples: int = 50,
 ) -> EvalDataset:
     """Extract messages from external tools, filter for relevance, and save.
@@ -651,7 +653,7 @@ def build_dataset_from_external(
     console.print(f"\n[bold]Total messages: {len(all_messages)}[/bold]")
     console.print(f"[bold]Filtering for relevance to skill: {skill_name}[/bold]")
 
-    relevance_filter = RelevanceFilter(model=model)
+    relevance_filter = RelevanceFilter(model=model, lm_kwargs=lm_kwargs)
     examples = relevance_filter.filter_and_score(
         all_messages, skill_name, skill_text, max_examples=max_examples,
     )

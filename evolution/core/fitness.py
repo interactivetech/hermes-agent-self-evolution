@@ -7,6 +7,7 @@ Supports length penalties and multi-dimensional scoring.
 import dspy
 from dataclasses import dataclass
 from typing import Optional
+from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
 from evolution.core.config import EvolutionConfig
 
@@ -72,7 +73,7 @@ class LLMJudge:
     ) -> FitnessScore:
         """Score an agent output using LLM-as-judge."""
 
-        lm = dspy.LM(self.config.eval_model)
+        lm = dspy.LM(self.config.eval_model, **self.config.lm_kwargs)
 
         with dspy.context(lm=lm):
             result = self.judge(
@@ -134,6 +135,42 @@ def skill_fitness_metric(example: dspy.Example, prediction: dspy.Prediction, tra
         score = 0.3 + (0.7 * overlap)
 
     return min(1.0, max(0.0, score))
+
+
+def gepa_skill_fitness_metric(
+    gold: dspy.Example,
+    pred: dspy.Prediction,
+    trace=None,
+    pred_name=None,
+    pred_trace=None,
+):
+    """GEPA-compatible metric wrapper with lightweight textual feedback."""
+    score = skill_fitness_metric(gold, pred, trace)
+
+    expected = getattr(gold, "expected_behavior", "") or ""
+    agent_output = getattr(pred, "output", "") or ""
+    task = getattr(gold, "task_input", "") or ""
+
+    feedback_parts = []
+    if not agent_output.strip():
+        feedback_parts.append("Output was empty.")
+    if expected and agent_output:
+        expected_words = set(expected.lower().split())
+        output_words = set(agent_output.lower().split())
+        missing = sorted(expected_words - output_words)
+        if missing:
+            feedback_parts.append(
+                "Missing expected concepts: " + ", ".join(missing[:12]) + "."
+            )
+    if task and len(agent_output) < 40:
+        feedback_parts.append("Response may be too brief for the task.")
+    if not feedback_parts:
+        feedback_parts.append(f"Trajectory scored {score:.3f} on keyword-overlap fitness.")
+
+    return ScoreWithFeedback(
+        score=score,
+        feedback=" ".join(feedback_parts),
+    )
 
 
 def _parse_score(value) -> float:

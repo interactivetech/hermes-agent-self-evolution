@@ -24,3 +24,7 @@ snapshots/
 .vscode/
 *.swp
 *.swo
+
+# Local OS / run artifacts
+.DS_Store
+output/

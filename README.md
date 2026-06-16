@@ -28,13 +28,35 @@ GEPA reads execution traces to understand *why* things fail (not just that they 
 ## Quick Start
 
 ```bash
-# Install
+# Install this repo
 git clone https://github.com/NousResearch/hermes-agent-self-evolution.git
 cd hermes-agent-self-evolution
-pip install -e ".[dev]"
 
-# Point at your hermes-agent repo
-export HERMES_AGENT_REPO=~/.hermes/hermes-agent
+# Create a local Python 3.11 virtualenv for this project
+uv venv .venv --python 3.11
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+
+# If you expect to use DSPy's MIPROv2 fallback optimizer, also install optuna.
+# zsh requires quoting brackets in extras syntax:
+uv pip install 'dspy[optuna]'
+
+# Point at your Hermes source checkout
+# Current local setup:
+#   Hermes repo:  ~/Documents/2026_research_projects/hermes-dev
+#   Hermes home:  ~/.hermes-dev
+export HERMES_AGENT_REPO=~/Documents/2026_research_projects/hermes-dev
+export HERMES_HOME=~/.hermes-dev
+
+# Set credentials for the model provider you plan to use if needed.
+# This is only required when you are not already using a custom provider
+# from $HERMES_HOME/config.yaml.
+export OPENAI_API_KEY=your_key_here
+
+# Optional sanity check
+test -d "$HERMES_AGENT_REPO/.git" && echo "Hermes repo found"
+test -f "$HERMES_HOME/config.yaml" && echo "Hermes dev config found"
+test -n "$OPENAI_API_KEY" && echo "OpenAI key found (optional if using Hermes custom provider)"
 
 # Evolve a skill (synthetic eval data)
 python -m evolution.skills.evolve_skill \
@@ -48,6 +70,30 @@ python -m evolution.skills.evolve_skill \
     --iterations 10 \
     --eval-source sessiondb
 ```
+
+If you use a different LiteLLM provider, pass provider-qualified model names such as
+`--eval-model anthropic/claude-sonnet-4` and export that provider's API key first.
+
+If your Hermes config already points at a custom OpenAI-compatible endpoint such as vLLM,
+this repo will automatically reuse the active provider from `$HERMES_HOME/config.yaml`.
+You can also override it explicitly with `--base-url`, `--api-key`, `--eval-model`,
+and `--optimizer-model`.
+
+## Current State
+
+Phase 1 skill evolution is runnable with DSPy + GEPA against local Hermes skills,
+including Hermes-configured OpenAI-compatible endpoints such as vLLM.
+
+Current behavior and caveats:
+
+- The active optimization path is still GEPA over a DSPy skill wrapper.
+- Synthetic datasets are generated from the target skill text and are useful for
+  plumbing validation, but they are not grounded in a real repository/task fixture.
+- Result scores currently come from a lightweight rubric/keyword-overlap metric, so
+  runs can overfit to rubric wording rather than improve real task performance.
+- A run may improve the DSPy program behavior without producing a materially changed
+  `SKILL.md` artifact; interpret output metrics accordingly.
+- Output artifacts are written under `output/<skill>/<timestamp>/` for manual review.
 
 ## What It Optimizes
 

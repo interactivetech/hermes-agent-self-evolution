@@ -18,10 +18,16 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from evolution.core.config import EvolutionConfig, get_hermes_agent_path
+from evolution.core.config import (
+    EvolutionConfig,
+    get_hermes_agent_path,
+    get_missing_credentials_message,
+    load_hermes_provider_config,
+    normalize_model_for_litellm,
+)
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
+from evolution.core.fitness import skill_fitness_metric, gepa_skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
     SkillModule,
@@ -38,23 +44,55 @@ def evolve(
     iterations: int = 10,
     eval_source: str = "synthetic",
     dataset_path: Optional[str] = None,
-    optimizer_model: str = "openai/gpt-4.1",
-    eval_model: str = "openai/gpt-4.1-mini",
+    optimizer_model: Optional[str] = None,
+    eval_model: Optional[str] = None,
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
+    hermes_provider = load_hermes_provider_config()
+    resolved_base_url = base_url or (hermes_provider.base_url if hermes_provider else None)
+    resolved_api_key = api_key or (hermes_provider.api_key if hermes_provider else None)
+    default_model = hermes_provider.model if hermes_provider else None
+    resolved_optimizer_model = normalize_model_for_litellm(
+        optimizer_model or default_model or "openai/gpt-4.1",
+        base_url=resolved_base_url,
+    )
+    resolved_eval_model = normalize_model_for_litellm(
+        eval_model or default_model or "openai/gpt-4.1-mini",
+        base_url=resolved_base_url,
+    )
+
     config = EvolutionConfig(
         iterations=iterations,
-        optimizer_model=optimizer_model,
-        eval_model=eval_model,
-        judge_model=eval_model,  # Use same model for dataset generation
+        optimizer_model=resolved_optimizer_model,
+        eval_model=resolved_eval_model,
+        judge_model=resolved_eval_model,  # Use same model for dataset generation
         run_pytest=run_tests,
+        lm_kwargs={
+            k: v for k, v in {
+                "base_url": resolved_base_url,
+                "api_key": resolved_api_key,
+            }.items() if v
+        },
     )
     if hermes_repo:
         config.hermes_agent_path = Path(hermes_repo)
+
+    for model in (config.optimizer_model, config.eval_model, config.judge_model):
+        credential_error = get_missing_credentials_message(model, api_key=config.lm_kwargs.get("api_key"))
+        if credential_error:
+            console.print(f"[red]✗ {credential_error}[/red]")
+            console.print(
+                "  Example: export OPENAI_API_KEY=your_key_here"
+                if model.startswith("openai/")
+                else "  Export the provider API key in your shell and retry."
+            )
+            sys.exit(1)
 
     # ── 1. Find and load the skill ──────────────────────────────────────
     console.print(f"\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] — Evolving skill: [bold]{skill_name}[/bold]\n")
@@ -90,7 +128,8 @@ def evolve(
             skill_text=skill["raw"],
             sources=["claude-code", "copilot", "hermes"],
             output_path=save_path,
-            model=eval_model,
+            model=config.eval_model,
+            lm_kwargs=config.lm_kwargs,
         )
         if not dataset.all_examples:
             console.print("[red]✗ No relevant examples found from session history[/red]")
@@ -119,7 +158,7 @@ def evolve(
     # ── 3. Validate constraints on baseline ─────────────────────────────
     console.print(f"\n[bold]Validating baseline constraints[/bold]")
     validator = ConstraintValidator(config)
-    baseline_constraints = validator.validate_all(skill["body"], "skill")
+    baseline_constraints = validator.validate_all(skill["raw"], "skill")
     all_pass = True
     for c in baseline_constraints:
         icon = "✓" if c.passed else "✗"
@@ -134,11 +173,13 @@ def evolve(
     # ── 4. Set up DSPy + GEPA optimizer ─────────────────────────────────
     console.print(f"\n[bold]Configuring optimizer[/bold]")
     console.print(f"  Optimizer: GEPA ({iterations} iterations)")
-    console.print(f"  Optimizer model: {optimizer_model}")
-    console.print(f"  Eval model: {eval_model}")
+    console.print(f"  Optimizer model: {config.optimizer_model}")
+    console.print(f"  Eval model: {config.eval_model}")
+    if config.lm_kwargs.get("base_url"):
+        console.print(f"  Endpoint: {config.lm_kwargs['base_url']}")
 
     # Configure DSPy
-    lm = dspy.LM(eval_model)
+    lm = dspy.LM(config.eval_model, **config.lm_kwargs)
     dspy.configure(lm=lm)
 
     # Create the baseline skill module
@@ -155,8 +196,9 @@ def evolve(
 
     try:
         optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
-            max_steps=iterations,
+            metric=gepa_skill_fitness_metric,
+            max_full_evals=iterations,
+            reflection_lm=lm,
         )
 
         optimized_module = optimizer.compile(
@@ -167,14 +209,21 @@ def evolve(
     except Exception as e:
         # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
         console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
-        optimizer = dspy.MIPROv2(
-            metric=skill_fitness_metric,
-            auto="light",
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
+        try:
+            optimizer = dspy.MIPROv2(
+                metric=skill_fitness_metric,
+                auto="light",
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+                valset=valset,
+            )
+        except ImportError as import_error:
+            console.print("[red]✗ MIPROv2 fallback requires optional dependency 'optuna'[/red]")
+            console.print("  Install it with: pip install optuna")
+            console.print("  Or in zsh: pip install 'dspy[optuna]'")
+            raise import_error
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
@@ -186,7 +235,7 @@ def evolve(
 
     # ── 7. Validate evolved skill ───────────────────────────────────────
     console.print(f"\n[bold]Validating evolved skill[/bold]")
-    evolved_constraints = validator.validate_all(evolved_body, "skill", baseline_text=skill["body"])
+    evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["raw"])
     all_pass = True
     for c in evolved_constraints:
         icon = "✓" if c.passed else "✗"
@@ -299,12 +348,14 @@ def evolve(
 @click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
               help="Source for evaluation dataset")
 @click.option("--dataset-path", default=None, help="Path to existing eval dataset (JSONL)")
-@click.option("--optimizer-model", default="openai/gpt-4.1", help="Model for GEPA reflections")
-@click.option("--eval-model", default="openai/gpt-4.1-mini", help="Model for evaluations")
+@click.option("--optimizer-model", default=None, help="Model for GEPA reflections")
+@click.option("--eval-model", default=None, help="Model for evaluations")
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run):
+@click.option("--base-url", default=None, help="Override the OpenAI-compatible API base URL")
+@click.option("--api-key", default=None, help="Override the provider API key")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, base_url, api_key):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -316,6 +367,8 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         hermes_repo=hermes_repo,
         run_tests=run_tests,
         dry_run=dry_run,
+        base_url=base_url,
+        api_key=api_key,
     )
 
 
